@@ -43,6 +43,13 @@ union tcctl_conf_field
 	int boolean;
 };
 
+struct tcctl_conf_entry
+{
+	const char *name;
+	union tcctl_conf_field *field;
+	int (*read_fn)(union tcctl_conf_field *field, const char *val);
+};
+
 struct tcctl_conf
 {
 	union tcctl_conf_field low_temp;       // stop below that temperature
@@ -57,7 +64,7 @@ struct tcctl_conf
 	union tcctl_conf_field pin_invert : 1; // invert pin (for p-mosfets)
 };
 
-enum tcctl_rc_command
+enum tcctl_rc_cmd
 {
 	// client commands
 	STAT, // get status     | p1 <- parameter id  | p2 <- n/a
@@ -80,7 +87,7 @@ union tcctl_rc_param
 
 struct tcctl_rc_msg
 {
-	enum tcctl_rc_command cmd;
+	enum tcctl_rc_cmd cmd;
 	union tcctl_rc_param p1, p2;
 };
 
@@ -92,13 +99,6 @@ struct tcctl_rc_addr
 
 #define RC_ADDR(ADDR) (ADDR).addr, (ADDR).len
 #define RECV_RC_ADDR(ADDR) (ADDR).addr, &((ADDR).len)
-
-struct tcctl_conf_entry
-{
-	const char *name;
-	union tcctl_conf_field *field;
-	int (*read_fn)(union tcctl_conf_field *field, const char *val);
-};
 
 static struct tcctl_stat stat;
 static struct tcctl_conf act_conf, new_conf;
@@ -133,7 +133,21 @@ static struct tcctl_rc_addr unsck_addr;
 int
 main(void)
 {
+	tcctl_setup_sig();
+	tcctl_init_gpio();
+	if (tcctl_init_fds())
+		return -1;
 
+	if (tcctl_rc_init())
+		return -1;
+	
+	for (;;)
+	{
+		if (tcctl_loop())
+			return -1;
+	}
+
+	return 0;
 }
 
 void
@@ -146,7 +160,7 @@ tcctl_setup_sig(void)
 void
 tcctl_kill_sig(int sig)
 {
-	// TODO set to run cooling, close GPIO
+	tcctl_gpio_write(1);
 	raise(sig); // handler is reset, will kill program
 }
 
@@ -159,15 +173,6 @@ tcctl_init_fds(void)
 
 	temp_fd = open(TEMP_PATHNAME, O_RDONLY | O_NONBLOCK);
 	if (temp_fd == -1)
-		return errno;
-
-	unsck_fd = socket(AF_UNIX, SOCK_DGRAM, SOCK_NONBLOCK);
-	if (unsck_fd == -1)
-		return errno;
-
-	tcctl_rc_addr_set(UNSCK_PATH);
-	
-	if (bind(unsck_fd, RC_ADDR(unsck_addr)) == -1)
 		return errno;
 
 	return 0;
@@ -193,12 +198,76 @@ tcctl_loop(void)
 		return errno;
 
 	tcctl_update();
+
+	return 0;
+}
+
+int
+tcctl_update(void)
+{
+	int is_on;
+
+	unsigned int temp = stat.last_temp;
+
+	switch (stat.phase)
+	{
+		case OVRD_IDLE:
+		case OVRD_RUN:
+			is_on = stat.phase == OVRD_RUN;
+			break;
+		
+		case LOW_TEMP:
+			if (temp > stat.low_temp)
+				stat.phase = IDLE;
+		case IDLE:
+			if (temp > stat.trig_temp)
+				stat.phase = HIGH_TEMP;
+			
+			is_on = 0;
+			break;
+		
+		case RUN:
+			if (temp > stat.trig_temp)
+				stat.phase = HIGH_TEMP;
+			if (temp < stat.trig_temp - act_conf.hyst_dec_temp)
+				stat.phase = IDLE;
+		case HIGH_TEMP:
+			if (temp < stat.trig_temp)
+				stat.phase = RUN;
+			
+			is_on = 1;
+			break;
+		
+		case FAIL:
+		default:
+			is_on = 1;
+	}
+
+	tcctl_gpio_write(is_on);
+	return tcctl_get_temp(&stat.last_temp);
+}
+
+int
+tcctl_gpio_init(void)
+{
+	if (!bcm2835_init())
+		return -1;
+
+	tcctl_gpio_init_pin(act_conf.output_pin.uint);
+	return 0;
 }
 
 void
-tcctl_update(void)
+tcctl_gpio_init_pin(unsigned int pin)
 {
-	// TODO update logic (got the hard parts first)
+	bcm2835_gpio_set_pud(pin, BCM2835_GPIO_PUD_DOWN);
+}
+
+void
+tcctl_gpio_write(int level)
+{
+	int true_level = act_conf.invert_pin ? !level : level;
+	bcm2835_gpio_write(act_conf.output_pin.uint, true_level);
 }
 
 size_t
@@ -216,7 +285,22 @@ tcctl_rc_addr_set(struct tcctl_rc_addr *addr, const char *path)
 }
 
 int
-tcctl_recv_rc_msg(void)
+tcctl_rc_init(const char *path)
+{
+	unsck_fd = socket(AF_UNIX, SOCK_DGRAM, SOCK_NONBLOCK);
+	if (unsck_fd == -1)
+		return errno;
+
+	tcctl_rc_addr_set(path);
+	
+	if (bind(unsck_fd, RC_ADDR(unsck_addr)) == -1)
+		return errno;
+
+	return 0;
+}
+
+int
+tcctl_rc_recv_msg(void)
 {	
 	struct tcctl_rc_addr cl_addr;
 	char cl_path[UNSCK_PATH_MAX_LEN] = { 0 };
@@ -236,14 +320,14 @@ tcctl_recv_rc_msg(void)
 	if (msg_size != sizeof(struct tcctl_msg_rc)
 		return -1; // malformed message/no data
 
-	if (tcctl_handle_rc_msg(&rc_msg, &cl_addr) == -1)
+	if (tcctl_rc_handle_msg(&rc_msg, &cl_addr) == -1)
 		return -1; // let it crash
 	
 	return 0;
 }
 
 int
-tcctl_handle_rc_msg(struct tcctl_rc_msg *msg, struct tcctl_rc_addr *addr)
+tcctl_rc_handle_msg(struct tcctl_rc_msg *msg, struct tcctl_rc_addr *addr)
 {
 	struct tcctl_rc_msg rmsg;
 	switch (msg->cmd)
@@ -253,7 +337,7 @@ tcctl_handle_rc_msg(struct tcctl_rc_msg *msg, struct tcctl_rc_addr *addr)
 			rmsg.p1 = msg->p1;
 			rmsg.p2 = tcctl_stat_get(msg->p1.uint);
 
-			return tcctl_send_rc_msg(&rmsg, addr);
+			return tcctl_rc_send_msg(&rmsg, addr);
 		case OVRD:
 			tcctl_stat.phase = msg->p1.boolean ? 
 				OVRD_RUN : OVRD_HOLD;
@@ -275,7 +359,7 @@ tcctl_handle_rc_msg(struct tcctl_rc_msg *msg, struct tcctl_rc_addr *addr)
 				rmsg.p1.sint = conf_errline;
 				rmsg.p2.sint = conf_errentid;
 
-				tcctl_send_rc_msg(&rmsg, addr);
+				tcctl_rc_send_msg(&rmsg, addr);
 
 				return -1;
 			}
@@ -289,7 +373,7 @@ tcctl_handle_rc_msg(struct tcctl_rc_msg *msg, struct tcctl_rc_addr *addr)
 }
 
 int
-tcctl_send_rc_msg(struct tcctl_rc_msg *msg, struct tcctl_rc_addr *addr)
+tcctl_rc_send_msg(struct tcctl_rc_msg *msg, struct tcctl_rc_addr *addr)
 {
 	return sendto(
 		unsck_fd, 
