@@ -2,18 +2,16 @@
 #define _TCCTL_H_
 
 #define CONF_PATH "/etc/tcctl/tcctl.conf"
-#define TEMP_PATH "temp_dummy"
+#define TEMP_PATH "/sys/class/thermal/thermal_zone0/temp"
 #define UNSCK_PATH "af_un_tcctl.serv"
 #define UNSCK_PATH_MAX_LEN 64
 
-enum tcctl_phase;
 struct tcctl_stat;
 
 union tcctl_conf_field;
 struct tcctl_conf_entry;
 struct tcctl_conf;
 
-enum tcctl_rc_cmd;
 union tcctl_rc_param;
 struct tcctl_rc_msg;
 

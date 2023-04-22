@@ -59,9 +59,9 @@ struct tcctl_conf
 	union tcctl_conf_field update_delay;   // how much time to sleep min	
 	union tcctl_conf_field output_pin;     // output pin to the switch
 
-	union tcctl_conf_field stay_on : 1;    // fan always on
-	union tcctl_conf_field stop : 1;       // stop the temperature control
-	union tcctl_conf_field pin_invert : 1; // invert pin (for p-mosfets)
+	union tcctl_conf_field stay_on;    // fan always on
+	union tcctl_conf_field stop;       // stop the temperature control
+	union tcctl_conf_field pin_invert; // invert pin (for p-mosfets)
 };
 
 enum tcctl_rc_cmd
@@ -100,22 +100,22 @@ struct tcctl_rc_addr
 #define RC_ADDR(ADDR) (ADDR).addr, (ADDR).len
 #define RECV_RC_ADDR(ADDR) (ADDR).addr, &((ADDR).len)
 
-static struct tcctl_stat stat;
+static struct tcctl_stat act_stat;
 static struct tcctl_conf act_conf, new_conf;
 
 #define CONF_ENTRIES 8
 #define CONF_ENTRY(FIELD) #FIELD, &new_conf.FIELD
 
-static struct tcctl_conf_entry tcctl_conf_entries[CONF_ENTRIES] = 
+static struct tcctl_conf_entry tcctl_conf_entries[] = 
 {	
 	{ CONF_ENTRY(low_temp),      tcctl_get_uint },
 	{ CONF_ENTRY(trig_temp),     tcctl_get_uint },
 	{ CONF_ENTRY(hyst_dec_temp), tcctl_get_uint },
 	{ CONF_ENTRY(update_delay),  tcctl_get_uint },
 	{ CONF_ENTRY(output_pin),    tcctl_get_uint },
-	{ CONF_ENTRY(stay_on),       tcctl_get_bool },
-	{ CONF_ENTRY(stop),          tcctl_get_bool },
-	{ CONF_ENTRY(pin_invert),    tcctl_get_bool }
+	{ CONF_ENTRY(stay_on),       tcctl_get_boolean },
+	{ CONF_ENTRY(stop),          tcctl_get_boolean },
+	{ CONF_ENTRY(pin_invert),    tcctl_get_boolean }
 };
 
 static struct sigaction tcctl_kill_sigaction = 
@@ -134,11 +134,11 @@ int
 main(void)
 {
 	tcctl_setup_sig();
-	tcctl_init_gpio();
+	tcctl_gpio_init();
 	if (tcctl_init_fds())
 		return -1;
 
-	if (tcctl_rc_init())
+	if (tcctl_rc_init(UNSCK_PATH))
 		return -1;
 	
 	for (;;)
@@ -339,17 +339,17 @@ tcctl_rc_handle_msg(struct tcctl_rc_msg *msg, struct tcctl_rc_addr *addr)
 
 			return tcctl_rc_send_msg(&rmsg, addr);
 		case OVRD:
-			tcctl_stat.phase = msg->p1.boolean ? 
+			act_stat.phase = msg->p1.boolean ? 
 				OVRD_RUN : OVRD_HOLD;
 			
 			return 0;
 		case AUTO:
-			tcctl_stat.phase = RUN; // will switch automatically
+			act_stat.phase = RUN; // will switch automatically
 		
 			return 0;
 		case TRIG:
-			tcctl_stat.low_temp = msg->p1.uint;
-			tcctl_stat.trig_temp = msg->p2.uint;
+			act_stat.low_temp = msg->p1.uint;
+			act_stat.trig_temp = msg->p2.uint;
 
 			return 0;
 		case CONF:
@@ -366,7 +366,6 @@ tcctl_rc_handle_msg(struct tcctl_rc_msg *msg, struct tcctl_rc_addr *addr)
 
 			return 0;
 		case KILL:
-			return -1;
 		default:
 			return -1;
 	}
@@ -390,13 +389,13 @@ tcctl_stat_get(unsigned int param_id)
 	switch (param_id)
 	{
 		case 0:
-			return tcctl_stat.last_temp;
+			return act_stat.last_temp;
 		case 1:
-			return tcctl_stat.low_temp;
+			return act_stat.low_temp;
 		case 2:
-			return tcctl_stat.trig_temp;
+			return act_stat.trig_temp;
 		case 3:
-			return tcctl_stat.phase;
+			return act_stat.phase;
 		default:
 			return 0;
 	}
@@ -405,7 +404,7 @@ tcctl_stat_get(unsigned int param_id)
 int
 tcctl_temp_read(unsigned int *temp_var)
 {
-	// TODO try reading from temperature file	
+	// TODO try reading from temperature file
 }
 
 void
@@ -507,7 +506,8 @@ tcctl_conf_read_next_line(const char *conf_str)
 		}
 	}
 
-	conf_errentid = -1;
+	conf_errline = 0;
+	conf_errentid = CONF_ENTRIES;
 	return NULL;
 }
 
