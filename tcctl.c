@@ -1,104 +1,4 @@
-#include <stddef.h>
-#include <unistd.h>
-#include <errno.h>
-#include <signal.h>
-// file, memory mapping
-#include <fnctl.h>
-#include <sys/mman.h>
-#include <sys/ioctl.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-// comms
-#include <sys/socket.h>
-#include <sys/un.h>
-#include <sys/select.h>
-
-#include "bcm2835.h"
-
 #include "tcctl.h"
-
-enum tcctl_phase
-{
-	LOW_TEMP,  // temperature below threshold (always off)
-	IDLE,      // ready for cooling
-	RUN,       // cooling
-	HIGH_TEMP, // temperature above threshold (always on)
-	OVRD_IDLE, // start and stay idle
-	OVRD_RUN,  // start and stay running
-	FAIL       // failure
-};
-
-struct tcctl_stat
-{
-	unsigned int last_temp;
-	unsigned int low_temp;
-	unsigned int trig_temp;
-
-	enum tcctl_phase phase;
-};
-
-union tcctl_conf_field
-{
-	unsigned int uint;
-	int boolean;
-};
-
-struct tcctl_conf_entry
-{
-	const char *name;
-	union tcctl_conf_field *field;
-	int (*read_fn)(union tcctl_conf_field *field, const char *val);
-};
-
-struct tcctl_conf
-{
-	union tcctl_conf_field low_temp;       // stop below that temperature
-	union tcctl_conf_field trig_temp;      // start cooling when reached
-	union tcctl_conf_field hyst_dec_temp;  // minimal temp drop to stop
-
-	union tcctl_conf_field update_delay;   // how much time to sleep min	
-	union tcctl_conf_field output_pin;     // output pin to the switch
-
-	union tcctl_conf_field stay_on;    // fan always on
-	union tcctl_conf_field stop;       // stop the temperature control
-	union tcctl_conf_field pin_invert; // invert pin (for p-mosfets)
-};
-
-enum tcctl_rc_cmd
-{
-	// client commands
-	STAT, // get status     | p1 <- parameter id  | p2 <- n/a
-	OVRD, // force run/hold | p1 <- on/off        | p2 <- n/a
-	AUTO, // automatic mode | p1 <- n/a           | p2 <- n/a
-	TRIG, // trigger temps  | p1 <- low temp      | p2 <- trigger temp
-	CONF, // reload conf    | p1 <- n/a           | p2 <- n/a
-	KILL, // kill service   | p1 <- n/a           | p2 <- n/a
-	// service responses
-	INFO, // return status  | p1 <- parameter id  | p2 <- return value
-	CERR, // conf error     | p1 <- conf entry id | p2 <- conf line
-};
-
-union tcctl_rc_param
-{
-	unsigned int uint;
-	int sint;
-	int boolean;
-};
-
-struct tcctl_rc_msg
-{
-	enum tcctl_rc_cmd cmd;
-	union tcctl_rc_param p1, p2;
-};
-
-struct tcctl_rc_addr
-{
-	struct sockaddr_un *addr;
-	socklen_t len;
-};
-
-#define RC_ADDR(ADDR) (ADDR).addr, (ADDR).len
-#define RECV_RC_ADDR(ADDR) (ADDR).addr, &((ADDR).len)
 
 static struct tcctl_stat act_stat;
 static struct tcctl_conf act_conf, new_conf;
@@ -215,7 +115,6 @@ tcctl_update(void)
 		case OVRD_RUN:
 			is_on = stat.phase == OVRD_RUN;
 			break;
-		
 		case LOW_TEMP:
 			if (temp > stat.low_temp)
 				stat.phase = IDLE;
@@ -225,8 +124,8 @@ tcctl_update(void)
 			
 			is_on = 0;
 			break;
-		
 		case RUN:
+			// switch to high temp mode
 			if (temp > stat.trig_temp)
 				stat.phase = HIGH_TEMP;
 			if (temp < stat.trig_temp - act_conf.hyst_dec_temp)
@@ -237,9 +136,9 @@ tcctl_update(void)
 			
 			is_on = 1;
 			break;
-		
 		case FAIL:
 		default:
+			// fail safe
 			is_on = 1;
 	}
 
@@ -269,6 +168,9 @@ tcctl_gpio_write(int level)
 	int true_level = act_conf.invert_pin ? !level : level;
 	bcm2835_gpio_write(act_conf.output_pin.uint, true_level);
 }
+
+#define RC_ADDR(ADDR) (ADDR).addr, (ADDR).len
+#define RECV_RC_ADDR(ADDR) (ADDR).addr, &((ADDR).len)
 
 size_t
 tcctl_rc_addr_len(const char *path)
@@ -317,7 +219,7 @@ tcctl_rc_recv_msg(void)
 		RECV_RC_ADDR(cl_addr)
 	);
 
-	if (msg_size != sizeof(struct tcctl_msg_rc)
+	if (msg_size != sizeof(struct tcctl_msg_rc))
 		return -1; // malformed message/no data
 
 	if (tcctl_rc_handle_msg(&rc_msg, &cl_addr) == -1)
@@ -329,22 +231,22 @@ tcctl_rc_recv_msg(void)
 int
 tcctl_rc_handle_msg(struct tcctl_rc_msg *msg, struct tcctl_rc_addr *addr)
 {
-	struct tcctl_rc_msg rmsg;
+	struct tcctl_rc_msg ret_msg;
 	switch (msg->cmd)
 	{
 		case STAT:	
-			rmsg.cmd = INFO;
-			rmsg.p1 = msg->p1;
-			rmsg.p2 = tcctl_stat_get(msg->p1.uint);
+			ret_msg.cmd = INFO;
+			ret_msg.p1 = msg->p1;
+			ret_msg.p2 = tcctl_stat_get(msg->p1.uint);
 
-			return tcctl_rc_send_msg(&rmsg, addr);
+			return tcctl_rc_send_msg(&ret_msg, addr);
 		case OVRD:
 			act_stat.phase = msg->p1.boolean ? 
 				OVRD_RUN : OVRD_HOLD;
 			
 			return 0;
 		case AUTO:
-			act_stat.phase = RUN; // will switch automatically
+			act_stat.phase = RUN; // switch to auto mode
 		
 			return 0;
 		case TRIG:
@@ -353,13 +255,13 @@ tcctl_rc_handle_msg(struct tcctl_rc_msg *msg, struct tcctl_rc_addr *addr)
 
 			return 0;
 		case CONF:
-			if (tcctl_load_conf() == -1)
+			if (tcctl_conf_load(conf_fd) == -1)
 			{
-				rmsg.cmd = CERR;
-				rmsg.p1.sint = conf_errline;
-				rmsg.p2.sint = conf_errentid;
+				ret_msg.cmd = CERR;
+				ret_msg.p1.sint = conf_errline;
+				ret_msg.p2.sint = conf_errentid;
 
-				tcctl_rc_send_msg(&rmsg, addr);
+				tcctl_rc_send_msg(&ret_msg, addr);
 
 				return -1;
 			}
@@ -402,9 +304,36 @@ tcctl_stat_get(unsigned int param_id)
 }
 
 int
-tcctl_temp_read(unsigned int *temp_var)
-{
-	// TODO try reading from temperature file
+tcctl_temp_read(int fd, unsigned int *temp_var)
+{	
+	struct stat fs;
+	if (fstat(fd, &fs) == -1)
+	{
+		close(fd);
+		return -1;
+	}
+
+	char *memblk = mmap(NULL, fs.st_size, PROT_READ, MAP_SHARED, fd, 0);
+	if (memblk == MAP_FAILED)
+	{
+		close(fd);
+		return -1;
+	}
+
+	char *str = memblk;
+	unsigned int temp = 0;
+
+	while (*str >= 0 && *str <= 9)
+	{
+		temp *= 10;
+		temp = *str - '0';
+	}
+	
+	*temp_var = temp / 1000;
+
+	munmap(memblk, fs.st_size);
+	
+	return 0;
 }
 
 void
@@ -438,7 +367,7 @@ tcctl_conf_copy(struct tcctl_conf *from, struct tcctl_conf *to)
 }
 
 int
-tcctl_conf_read(void)
+tcctl_conf_load(int fd)
 {
 	struct stat fs;
 	if (fstat(fd, &fs) == -1)
