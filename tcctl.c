@@ -18,10 +18,19 @@ static struct tcctl_conf_entry tcctl_conf_entries[] =
 	{ CONF_ENTRY(pin_invert),    tcctl_get_boolean }
 };
 
+#define ARG_ENTRIES 3
+
+static struct tcctl_arg arg_entries[ARG_ENTRIES] =
+{
+	{ "--help", "", "show help", 		tcctl_arg_help, POST_EXIT },
+	{ "--conf", "<PATH>", "set conf path", 	tcctl_arg_conf, POST_NORM },
+	{ "--log",  "<PATH>", "set log path",	tcctl_arg_log,  POST_NORM }
+};
+
 static struct sigaction tcctl_kill_sigaction = 
 {
 	.sa_handler = tcctl_kill_sig,
-	.sa_mask    = 0,
+	.sa_mask    = { 0 },
 	.sa_flags   = SA_RESETHAND
 };
 
@@ -30,37 +39,156 @@ static struct sigaction tcctl_kill_sigaction =
 #define LOG_INFO(MSG, VAL) tcctl_log_info(MSG, VAL, __FUNCTION__, 0)
 #define LOG_WARN(MSG, VAL) tcctl_log_info(MSG, VAL, __FUNCTION__, 1)
 #define LOG_ERROR(MSG, VAL) tcctl_log_error(MSG, VAL, __FUNCTION__, LSTR(__LINE__))
+#define STDOUT_PRINT(MSG) tcctl_stdout_write(MSG);
 
-static int log_fd, conf_fd, temp_fd;
+static char *log_path, *conf_path;
+static int stdout_fd, log_fd, conf_fd, temp_fd;
 static int conf_errline, conf_errentid;
 static int unsck_fd;
 static struct sockaddr_un unsck_sun_addr;
 static struct tcctl_rc_addr unsck_addr; 
 
 int
-main(void)
+main(int argc, char *argv[])
 {
+	tcctl_pre_init();
+
+	if (!tcctl_args_parse(argc - 1, argv + 1))
+		return 1;
+
 	tcctl_setup_sig();
 	if (!tcctl_fd_init())
-		return 1;
+		return 2;
 
 	tcctl_conf_reset(&new_conf);
 	if (!tcctl_conf_load(conf_fd))
-		return 2;
+		return 3;
 	
 	tcctl_conf_apply(&new_conf, &run_conf);
 
 	if (!tcctl_gpio_init())
-		return 3;
+		return 4;
 
 	if (!tcctl_rc_init(UNSCK_PATH))
-		return 4;
+		return 5;
 	
 	for (;;)
 	{
 		if (!tcctl_loop())
 			return 0;
 	}
+}
+
+void
+tcctl_pre_init(void)
+{
+	log_path = LOG_PATH;
+	conf_path = CONF_PATH;
+
+	stdout_fd = STDOUT_FILENO;
+}
+
+#define ARG_FAILED 0
+#define ARG_CONSUMED(TK) (TK + 1)
+
+int
+tcctl_arg_help(int argr, char *pargv[])
+{
+	STDOUT_PRINT("showing help:\n");
+	for (size_t i = 0; i < ARG_ENTRIES; i++)
+	{
+		struct tcctl_arg arg = arg_entries[i];
+		STDOUT_PRINT("  ");
+		STDOUT_PRINT(arg.sym);
+		STDOUT_PRINT("  ");
+		STDOUT_PRINT(arg.params);
+		STDOUT_PRINT("\n    ");
+		STDOUT_PRINT(arg.desc);
+		STDOUT_PRINT("\n");
+	}
+	return ARG_CONSUMED(0);
+}
+
+int
+tcctl_arg_conf(int argr, char *pargv[])
+{
+	if (argr < 1) 
+	{
+		LOG_WARN("missing parameter <PATH>", NULL);	
+		return ARG_FAILED;
+	}
+
+	conf_path = pargv[1];
+	return ARG_CONSUMED(1);
+}
+
+int
+tcctl_arg_log(int argr, char *pargv[])
+{
+	if (argr < 1) 
+	{
+		LOG_WARN("missing parameter <PATH>", NULL);	
+		return ARG_FAILED;
+	}
+	
+	log_path = pargv[1];
+	return ARG_CONSUMED(1);
+}
+
+int
+tcctl_args_parse(int argc, char *argv[])
+{
+	int has_found;
+	int consumed;
+	struct tcctl_arg arg;
+	char **pargv = argv;
+	while (argc > 0)
+	{
+		has_found = 0;
+		for (size_t i = 0; i < ARG_ENTRIES; i++)
+		{
+			arg = arg_entries[i];
+			if (!str_eq(*pargv, arg.sym, ARG_SYM_MAX_LEN))
+				continue;
+
+			has_found = 1;
+			consumed = arg.parse(argc, pargv);
+			if (consumed == 0)
+			{
+				LOG_ERROR("could not parse arg: ", arg.sym);
+				return 0;
+			}
+
+			switch (arg.post)
+			{
+				case POST_EXIT:
+					return 0;
+				case POST_NORM:
+				default:
+					break;
+			}
+
+			argc -= consumed;
+			pargv += consumed;
+			break;
+		}
+
+		if (!has_found)
+		{
+			LOG_ERROR("passed unknown arg: ", arg.sym);
+			return 0;
+		}
+	}
+
+	if (argc < 0)
+	{
+		LOG_ERROR("internal: args consumed too much tokens", NULL);
+		return 0;
+	}
+
+	LOG_INFO("parsed all args", NULL);
+
+	return 1;
 }
 
 void
@@ -78,7 +206,7 @@ tcctl_kill_sig(int sig)
 	tcctl_gpio_write(run_conf.stay_on.boolean);
 	LOG_INFO("shutdown remote ctl", NULL);
 	tcctl_rc_end();
-	char temp_buf[4] = { '\0' };
+	char temp_buf[TEMP_BUF_LEN] = ZERO_STR;
 	uint_write_pad(run_stat.last_temp, temp_buf, 3);
 	LOG_INFO("current temperature: ", temp_buf);
 	LOG_INFO("exit", NULL);
@@ -89,16 +217,18 @@ int
 tcctl_fd_init(void)
 {
 	unlink(LOG_PATH);
-	log_fd = open(LOG_PATH, O_WRONLY | O_CREAT, S_IRWXU | S_IRGRP | S_IROTH);
+
+	LOG_INFO("log path: ", log_path);
+	log_fd = open(log_path, O_WRONLY | O_CREAT, S_IRWXU | S_IRGRP | S_IROTH);
 	if (log_fd == -1)
 	{
-		// can't log
+		LOG_ERROR("could not open log file: ", errno_msg(errno));
 		return 0;
 	}
-	LOG_INFO("tcctl start", NULL);
+	LOG_INFO("tcctl log start", NULL);
 
-	LOG_INFO("conf path: ", CONF_PATH);
-	conf_fd = open(CONF_PATH, O_RDONLY | O_NONBLOCK);
+	LOG_INFO("conf path: ", conf_path);
+	conf_fd = open(conf_path, O_RDONLY | O_NONBLOCK);
 	if (conf_fd == -1)
 	{
 		LOG_ERROR("could not open conf file: ", errno_msg(errno));
@@ -195,29 +325,30 @@ tcctl_update(void)
 int
 tcctl_gpio_init(void)
 {
-	if (!bcm2835_init())
+	if (!tcctl_gpio_init_pin(run_conf.output_pin.uint))
 	{
 		LOG_ERROR("could not init gpio", NULL);	
 		return 0;
 	}
-
-	tcctl_gpio_init_pin(run_conf.output_pin.uint);
 	LOG_INFO("gpio ok", NULL);
 	return 1;
 }
 
-void
+int
 tcctl_gpio_init_pin(unsigned int pin)
 {
-	bcm2835_gpio_fsel(pin, BCM2835_GPIO_FSEL_OUTP);
-	bcm2835_gpio_set_pud(pin, BCM2835_GPIO_PUD_DOWN);
+	if (!gpio_export(pin, GPIO_OPEN))
+		return 0;
+	if (!gpio_set_dir(pin, GPIO_OUT))
+		return 0;
+	return 1;
 }
 
-void
+int
 tcctl_gpio_write(int level)
 {
 	int true_level = run_conf.pin_invert.boolean ? !level : level;
-	bcm2835_gpio_write(run_conf.output_pin.uint, true_level);
+	return gpio_write(run_conf.output_pin.uint, true_level);
 }
 
 #define RC_ADDR(ADDR) (struct sockaddr *)(ADDR).addr, (ADDR).len
@@ -281,7 +412,7 @@ int
 tcctl_rc_recv_msg(void)
 {	
 	struct tcctl_rc_addr cl_addr;
-	char cl_path[UNSCK_PATH_MAX_LEN] = { '\0' };
+	char cl_path[UNSCK_PATH_MAX_LEN] = ZERO_STR;
 
 	tcctl_rc_addr_set(&cl_addr, cl_path);
 
@@ -420,7 +551,7 @@ tcctl_stat_update(struct tcctl_stat *stat, struct tcctl_conf *conf)
 int
 tcctl_temp_read(int fd, unsigned int *val)
 {
-	char str[TEMP_BUF_MAX_LEN] = { '\0' };
+	char str[TEMP_BUF_MAX_LEN] = ZERO_STR;
 	if (pread(fd, str, TEMP_BUF_MAX_LEN, 0) == -1)
 	{
 		LOG_ERROR("could not read sensor: ", errno_msg(errno));
@@ -465,6 +596,40 @@ tcctl_conf_apply(struct tcctl_conf *from, struct tcctl_conf *to)
 	to->pin_invert = from->pin_invert;
 }
 
+void
+tcctl_conf_log_error(const char *msg, const char *entry)
+{
+	char error_loc[ENTRY_NAME_MAX_LEN+ENTRY_LINE_MAX_LEN] = ZERO_STR;
+	char *p = error_loc;
+
+	p += str_copy(entry, p, ENTRY_NAME_MAX_LEN);
+	p += str_copy(" in line ", p, ENTRY_LINE_MAX_LEN);
+	if (uint_write(conf_errline, p) <= 0)
+	{
+		p += str_copy("---", p, ENTRY_LINE_MAX_LEN);
+		LOG_ERROR(msg, error_loc);
+	}
+	else
+		LOG_ERROR(msg, error_loc);
+}
+
+void
+tcctl_conf_log_load(
+		const char *msg, 
+		const char *entry, 
+		const char *val_text, 
+		size_t val_len
+)
+{
+	char load_info[ENTRY_NAME_MAX_LEN+ENTRY_LINE_MAX_LEN] = ZERO_STR;
+	char *p = load_info;
+
+	p += str_copy(entry, p, ENTRY_NAME_MAX_LEN);
+	p += str_copy(" = ", p, ENTRY_LINE_MAX_LEN);
+	p += str_copy(val_text, p, val_len);
+	LOG_INFO(msg, load_info);
+}
+
 int
 tcctl_conf_load(int fd)
 {
@@ -501,7 +666,6 @@ tcctl_conf_load(int fd)
 		conf_errline++;
 		if (str == NULL)
 		{
-			LOG_ERROR("malformed conf entry: ", NULL);
 			munmap(memblk, fs.st_size);
 			return 0;
 		}
@@ -514,11 +678,13 @@ tcctl_conf_load(int fd)
 	return 1;
 }
 
+#define CONF_IS_WSPACE(C) (C == ' ' || C == '\t')
+
 const char *
 tcctl_conf_read_next_line(const char *conf_str)
 {
 	const char *p = conf_str;
-	while (*p == ' ' || *p == '\t')
+	while (CONF_IS_WSPACE(*p))
 		p++;
 
 	if (*p == '\n')
@@ -527,21 +693,37 @@ tcctl_conf_read_next_line(const char *conf_str)
 	if (*p == '\0')
 		return p;
 
-	for (unsigned int i = 0; i < CONF_ENTRIES; i++)
+	for (size_t i = 0; i < CONF_ENTRIES; i++)
 	{
 		struct tcctl_conf_entry entry = tcctl_conf_entries[i];
 		size_t len = str_len(entry.name, ENTRY_NAME_MAX_LEN);
 		if (str_eq(p, entry.name, len))
 		{
-			int next = entry.read_fn(entry.field, p+len+1);
+			p += len;
+			while (CONF_IS_WSPACE(*p)) 
+				p++;
+			int next = entry.read_fn(entry.field, p);
+			tcctl_conf_log_load(
+					"conf load entry: ", 
+					entry.name,
+					p,
+					next + 1
+			);
 			conf_errentid = i; // just in case
 			if (next == -1)
+			{
+				tcctl_conf_log_error(
+						"malformed conf entry: ", 
+						entry.name
+				);
 				return NULL;
-			else
-				return p+len+1+next+1;
+			}
+
+			return p+next+1;
 		}
 	}
 
+	tcctl_conf_log_error("unknown conf entry: ", "");
 	conf_errline = 0;
 	conf_errentid = CONF_ENTRIES;
 	return NULL;
@@ -566,17 +748,23 @@ tcctl_log_writeln(const char **msgs, size_t cnt)
 	{
 		const char *msg = *(msgs+i);
 		if (msg == NULL) continue;
-		write(log_fd, msg, str_len(msg, LOG_MSG_MAX_LEN));
+		size_t msg_len = str_len(msg, MSG_MAX_LEN);
+		if (log_fd)
+			write(log_fd, msg, msg_len);
+		write(stdout_fd, msg, msg_len);
 	}
-	write(log_fd, "\n", 1);
-	fsync(log_fd);
+	if (log_fd)
+		write(log_fd, "\n", 1);
+	write(stdout_fd, "\n", 1);
+	if (log_fd)
+		fsync(log_fd);
 }
 
 void 
 tcctl_log_info(const char *msg, const char *val, const char *src, int warn)
 {
 	const char *header = warn ? "warn>" : "info>";
-	char time_buf[32] = { '\0' };
+	char time_buf[TIME_BUF_LEN] = ZERO_STR;
 	time_write(time_buf);
 	const char *msg_buf[] = 
 	{ 
@@ -588,7 +776,7 @@ tcctl_log_info(const char *msg, const char *val, const char *src, int warn)
 void 
 tcctl_log_error(const char *msg, const char *val, const char *src, const char *loc)
 {
-	char time_buf[32] = { '\0' };
+	char time_buf[TIME_BUF_LEN] = ZERO_STR;
 	time_write(time_buf);
 	const char *msg_buf[] = 
 	{ 
@@ -597,13 +785,21 @@ tcctl_log_error(const char *msg, const char *val, const char *src, const char *l
 	tcctl_log_writeln(msg_buf, 11);
 }
 
+void
+tcctl_stdout_write(const char *msg)
+{
+	write(stdout_fd, msg, str_len(msg, MSG_MAX_LEN));
+}
+
 int
 str_eq(const char *s1, const char *s2, size_t max_len)
 {
 	for (size_t i = 0; i < max_len; i++)
 	{
-		if (*s1 != *s2) return 0;
-		if (*s1 == '\0' || *s2 == '\0') break;
+		if (*s1 != *s2) 
+			return 0;
+		if (*s1 == '\0' || *s2 == '\0') 
+			break;
 		s1++;
 		s2++;
 	}
@@ -615,7 +811,7 @@ size_t
 str_copy(const char *from, char *to, size_t max_len)
 {
 	size_t len = 0;
-	while (*from != '\0' && len < max_len)
+	while (*from != '\0' && len < max_len - 1)
 	{
 		*to++ = *from++;
 		len++;
@@ -628,12 +824,13 @@ size_t
 str_set(char c, char *to, size_t max_len)
 {
 	size_t len = 0;
-	while (*to != '\0' && len < max_len)
+	while (*to != '\0' && len < max_len - 1)
 	{
 		*to++ = c;
 		len++;
 	}
-
+	
+	*to = '\0';
 	return len;
 }
 
@@ -641,10 +838,31 @@ size_t
 str_len(const char *s, size_t max_len)
 {
 	size_t len = 0;
-	while (*s++ != '\0' && len < max_len)
+	while (*s++ != '\0' && len < max_len - 1)
 		len++;
 
 	return len;
+}
+
+size_t
+str_zlen(const char *s, size_t max_len)
+{
+	return str_len(s, max_len) + 1;
+}
+
+size_t 
+str_join(char *to, char *s, size_t max_len)
+{
+	size_t len = str_len(to, max_len);
+	char *p = to+len;
+	while (*s != '\0' && len < max_len - 1)
+	{
+		*p++ = *s++;
+		len++;
+	}
+
+	*p = '\0';
+	return len + 1;
 }
 
 int
@@ -676,7 +894,7 @@ uint_read(unsigned int *val, const char *str)
 	}
 
 	unsigned int num = 0;
-	for (unsigned short i = 0; i < places; i++)
+	for (size_t i = 0; i < places; i++)
 	{
 		char c = *(str+i);
 		if (c >= '0' && c <= '9')
@@ -694,7 +912,6 @@ int
 uint_write(unsigned int val, char *str)
 {
 	unsigned short places = 0;
-
 	unsigned int num = val;
 	while (num > 0)
 	{
@@ -744,6 +961,160 @@ boolean_write(int val, char *str)
 	return str_copy(val ? "true" : "false", str, 5);
 }
 
+struct gpio_export_sys
+{
+	const char path[32];
+};
+
+struct gpio_export_sys export_sys_entries[] =
+{
+	{ GPIO_SYS_PATH "export"   }, // GPIO_OPEN
+	{ GPIO_SYS_PATH "unexport" }  // GPIO_CLOSE
+};
+
+void
+gpio_print_pin(const char *msg, unsigned int pin)
+{
+	char pin_buf[GPIO_BUF_LEN] = ZERO_STR;
+	if (pin == -1)
+		str_copy("-1", pin_buf, GPIO_BUF_LEN);
+	else if (uint_write(pin, pin_buf) <= 0)
+		str_set('-', pin_buf, GPIO_BUF_LEN);
+	LOG_INFO(msg, pin_buf);	
+}
+
+int
+gpio_warn_pin(unsigned int pin)
+{
+	if (pin > GPIO_MAX_PIN)
+	{
+		char pin_buf[GPIO_BUF_LEN];
+		if (pin == -1)
+			str_copy("-1", pin_buf, GPIO_BUF_LEN);
+		else if (uint_write(pin, pin_buf) <= 0)
+			str_set('X', pin_buf, GPIO_BUF_LEN);
+		LOG_WARN("pin not in bank: P", pin_buf);
+		return 0;
+	}
+
+	return 1;
+}
+
+int 
+gpio_export(unsigned int pin, enum gpio_export eop)
+{
+	gpio_warn_pin(pin);
+
+	if (eop == GPIO_OPEN) 
+		gpio_print_pin("open pin: P", pin);
+	else
+	       	gpio_print_pin("close pin: P", pin);
+
+	char pin_buf[GPIO_BUF_LEN] = ZERO_STR;
+	int fd;
+
+	fd = open(export_sys_entries[eop].path, O_WRONLY);
+	if (fd == -1)
+	{
+		LOG_ERROR("could not open sysfs: ", errno_msg(errno));	
+		return 0;
+	}
+	if (uint_write(pin, pin_buf) <= 0)
+	{
+		LOG_ERROR("could not convert pin to text", NULL);
+		return 0;
+	}
+	write(fd, pin_buf, str_len(pin_buf, GPIO_BUF_LEN));
+	
+	close(fd);
+	return 1;
+}
+
+struct gpio_dir_sys
+{
+	const char text[4];
+	size_t len;
+};
+
+struct gpio_dir_sys dir_sys_entries[] =
+{
+	{ "in",  2 }, // GPIO_IN
+	{ "out", 3 }  // GPIO_OUT
+};
+
+int 
+gpio_set_dir(unsigned int pin, enum gpio_dir dir)
+{
+	gpio_warn_pin(pin);
+
+	if (dir == GPIO_IN)
+		gpio_print_pin("set pin in: P", pin);
+	else
+		gpio_print_pin("set pin out: P", pin);
+
+	char path[GPIO_PATH_LEN] = GPIO_DIR_PATH0;
+	char pin_buf[GPIO_BUF_LEN] = ZERO_STR;
+	int fd;
+
+	if (uint_write(pin, pin_buf) <= 0)
+	{
+		LOG_ERROR("could not convert pin to text", NULL);
+		return 0;
+	}
+
+	str_join(path, pin_buf, GPIO_PATH_LEN);
+	str_join(path, GPIO_DIR_PATH1, GPIO_PATH_LEN);
+	LOG_INFO("write sysfs dir path: ", path);
+
+	fd = open(path, O_WRONLY);
+	if (fd == -1) 
+	{
+		LOG_ERROR("could not open sysfs: ", errno_msg(errno));
+		return 0;
+	}
+
+	struct gpio_dir_sys dir_sys_entry = dir_sys_entries[dir];
+
+	if (write(fd, dir_sys_entry.text, dir_sys_entry.len) == -1)
+	{
+		LOG_ERROR("could not write to sysfs: ", errno_msg(errno));
+		return 0;
+	}
+
+	close(fd);
+	return 1;
+}
+
+int 
+gpio_write(unsigned int pin, enum gpio_val val)
+{
+	gpio_warn_pin(pin);
+
+	if (val == GPIO_LOW)
+		gpio_print_pin("write LOW: P", pin);
+	else
+		gpio_print_pin("write HIGH: P", pin);
+
+	char path[GPIO_PATH_LEN];
+	int fd;
+
+	fd = open(path, O_WRONLY);
+	if (fd == -1)
+	{
+		LOG_ERROR("could not open sysfs: ", errno_msg(errno));
+		return 0;
+	}
+
+	if (write(fd, val == GPIO_LOW ? "0" : "1", 1))
+	{
+		LOG_ERROR("could not write to sysfs: ", errno_msg(errno));
+		return 0;
+	}
+
+	close(fd);
+	return 1;
+}
+
 int 
 time_write(char *str)
 {
@@ -754,12 +1125,10 @@ time_write(char *str)
 	unsigned int tsecs = s % 60;
 	unsigned int tmins = s / 60 % 60;
 	unsigned int thrs = s / 3600;
-	unsigned int ddays = time.tv_sec / 86400;
+	// unsigned int ddays = time.tv_sec / 86400;
 
 	char *p = str;
 
-	p+=uint_write_pad(ddays, p, 5);
-	*p++ = '/';
 	p+=uint_write_pad(thrs, p, 2);
 	*p++ = ':';
 	p+=uint_write_pad(tmins, p, 2);
@@ -912,5 +1281,5 @@ static const char *errno_msgs[] =
 const char *
 errno_msg(int err)
 {
-	return errno_msgs[err];	
+	return errno_msgs[err - 1];	
 }

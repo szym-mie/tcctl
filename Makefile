@@ -1,6 +1,7 @@
 CC = clang
 CCF += -s
-LIB += -lbcm2835 -lcap
+CCF += -Wall
+LIB += -lcap
 
 TARGET=tcctl
 
