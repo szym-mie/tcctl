@@ -1,4 +1,5 @@
 #include "tcctl.h"
+#include <linux/gpio.h>
 
 static struct tcctl_stat run_stat;
 static struct tcctl_conf run_conf, new_conf;
@@ -47,6 +48,8 @@ static int conf_errline, conf_errentid;
 static int unsck_fd;
 static struct sockaddr_un unsck_sun_addr;
 static struct tcctl_rc_addr unsck_addr; 
+static struct gpio gpio;
+static struct gpio_pin output_pin;
 
 int
 main(int argc, char *argv[])
@@ -325,21 +328,22 @@ tcctl_update(void)
 int
 tcctl_gpio_init(void)
 {
-	if (!tcctl_gpio_init_pin(run_conf.output_pin.uint))
-	{
+	gpio.path = "/dev/gpiochip1";
+	if (!gpio_open(&gpio))
 		LOG_ERROR("could not init gpio", NULL);	
 		return 0;
-	}
 	LOG_INFO("gpio ok", NULL);
 	return 1;
 }
 
 int
-tcctl_gpio_init_pin(unsigned int pin)
+tcctl_gpio_update_conf(unsigned int pin)
 {
-	if (!gpio_export(pin, GPIO_OPEN))
-		return 0;
-	if (!gpio_set_dir(pin, GPIO_OUT))
+	if (output_pin.pin == pin)
+		return 1;
+	output_pin.pin = pin;
+	output_pin.pull = GPIO_PULLDOWN;
+	if (!gpio_pin(&gpio, &output_pin))
 		return 0;
 	return 1;
 }
@@ -348,7 +352,13 @@ int
 tcctl_gpio_write(int level)
 {
 	int true_level = run_conf.pin_invert.boolean ? !level : level;
-	return gpio_write(run_conf.output_pin.uint, true_level);
+	if (!tcctl_gpio_update_conf(run_conf.output_pin.uint))
+	{
+		LOG_ERROR("could not init gpio pin", NULL);
+		return 0;
+	}
+
+	return gpio_write(&gpio, &output_pin, true_level);
 }
 
 #define RC_ADDR(ADDR) (struct sockaddr *)(ADDR).addr, (ADDR).len
@@ -961,17 +971,6 @@ boolean_write(int val, char *str)
 	return str_copy(val ? "true" : "false", str, 5);
 }
 
-struct gpio_export_sys
-{
-	const char path[32];
-};
-
-struct gpio_export_sys export_sys_entries[] =
-{
-	{ GPIO_SYS_PATH "export"   }, // GPIO_OPEN
-	{ GPIO_SYS_PATH "unexport" }  // GPIO_CLOSE
-};
-
 void
 gpio_print_pin(const char *msg, unsigned int pin)
 {
@@ -984,9 +983,9 @@ gpio_print_pin(const char *msg, unsigned int pin)
 }
 
 int
-gpio_warn_pin(unsigned int pin)
+gpio_warn_pin(struct gpio *gpio, unsigned int pin)
 {
-	if (pin > GPIO_MAX_PIN)
+	if (pin >= gpio->info.lines)
 	{
 		char pin_buf[GPIO_BUF_LEN];
 		if (pin == -1)
@@ -1001,117 +1000,102 @@ gpio_warn_pin(unsigned int pin)
 }
 
 int 
-gpio_export(unsigned int pin, enum gpio_export eop)
+gpio_open(struct gpio *gpio)
 {
-	gpio_warn_pin(pin);
+	LOG_INFO("open gpio bank at: ", gpio->path);
 
-	if (eop == GPIO_OPEN) 
-		gpio_print_pin("open pin: P", pin);
-	else
-	       	gpio_print_pin("close pin: P", pin);
-
-	char pin_buf[GPIO_BUF_LEN] = ZERO_STR;
-	int fd;
-
-	fd = open(export_sys_entries[eop].path, O_WRONLY);
-	if (fd == -1)
+	if (gpio->path == NULL)
 	{
-		LOG_ERROR("could not open sysfs: ", errno_msg(errno));	
+		LOG_ERROR("gpio path is null", NULL);
 		return 0;
 	}
-	if (uint_write(pin, pin_buf) <= 0)
+
+	int chip_fd = open(gpio->path, O_RDONLY);
+	if (chip_fd == -1)
 	{
-		LOG_ERROR("could not convert pin to text", NULL);
+		LOG_ERROR("cannot open gpio", errno_msg(errno));
 		return 0;
 	}
-	write(fd, pin_buf, str_len(pin_buf, GPIO_BUF_LEN));
+
+	gpio->chip_fd = chip_fd;
+
+	if (ioctl(chip_fd, GPIO_GET_CHIPINFO_IOCTL, &gpio->info) == -1)
+	{
+		LOG_ERROR("cannot read gpio info", errno_msg(errno));
+		gpio_close(gpio);
+		return 0;
+	}
+
+	return 1;
+}
+
+int 
+gpio_close(struct gpio *gpio)
+{
+	LOG_INFO("close gpio bank at: ", gpio->path);
+
+	if (gpio->chip_fd == -1)
+	{
+		LOG_WARN("gpio fd is null", gpio->path);
+		return 0;
+	}
+	close(gpio->chip_fd);
+	gpio->chip_fd = -1;
+	return 1;
+}
+
+int
+gpio_pin(struct gpio *gpio, struct gpio_pin *pin)
+{
+	gpio_warn_pin(gpio, pin->pin);
+
+	pin->hreq.lineoffsets[0] = pin->pin;
+	pin->hreq.flags = GPIOHANDLE_REQUEST_OUTPUT;
+	pin->hreq.lines = 1;
+
+	switch (pin->pull) 
+	{
+		case GPIO_NOPULL:
+			gpio_print_pin("no pull on pin: P", pin->pin);
+			pin->hreq.flags |= GPIOHANDLE_REQUEST_BIAS_DISABLE;
+			break;
+		case GPIO_PULLDOWN:
+			gpio_print_pin("pull down on pin: P", pin->pin);
+			pin->hreq.flags |= GPIOHANDLE_REQUEST_BIAS_PULL_DOWN;
+			break;
+		case GPIO_PULLUP:
+			gpio_print_pin("pull up on pin: P", pin->pin);
+			pin->hreq.flags |= GPIOHANDLE_REQUEST_BIAS_PULL_UP;
+			break;
+	}
 	
-	close(fd);
-	return 1;
-}
-
-struct gpio_dir_sys
-{
-	const char text[4];
-	size_t len;
-};
-
-struct gpio_dir_sys dir_sys_entries[] =
-{
-	{ "in",  2 }, // GPIO_IN
-	{ "out", 3 }  // GPIO_OUT
-};
-
-int 
-gpio_set_dir(unsigned int pin, enum gpio_dir dir)
-{
-	gpio_warn_pin(pin);
-
-	if (dir == GPIO_IN)
-		gpio_print_pin("set pin in: P", pin);
-	else
-		gpio_print_pin("set pin out: P", pin);
-
-	char path[GPIO_PATH_LEN] = GPIO_DIR_PATH0;
-	char pin_buf[GPIO_BUF_LEN] = ZERO_STR;
-	int fd;
-
-	if (uint_write(pin, pin_buf) <= 0)
+	if (ioctl(gpio->chip_fd, GPIO_GET_LINEHANDLE_IOCTL, &pin->hreq) == -1)
 	{
-		LOG_ERROR("could not convert pin to text", NULL);
+		LOG_ERROR("could not get a handle for a pin", errno_msg(errno));
 		return 0;
 	}
 
-	str_join(path, pin_buf, GPIO_PATH_LEN);
-	str_join(path, GPIO_DIR_PATH1, GPIO_PATH_LEN);
-	LOG_INFO("write sysfs dir path: ", path);
-
-	fd = open(path, O_WRONLY);
-	if (fd == -1) 
-	{
-		LOG_ERROR("could not open sysfs: ", errno_msg(errno));
-		return 0;
-	}
-
-	struct gpio_dir_sys dir_sys_entry = dir_sys_entries[dir];
-
-	if (write(fd, dir_sys_entry.text, dir_sys_entry.len) == -1)
-	{
-		LOG_ERROR("could not write to sysfs: ", errno_msg(errno));
-		return 0;
-	}
-
-	close(fd);
 	return 1;
 }
 
 int 
-gpio_write(unsigned int pin, enum gpio_val val)
+gpio_write(struct gpio *gpio, struct gpio_pin *pin, enum gpio_val val)
 {
-	gpio_warn_pin(pin);
+	struct gpiohandle_data hdat;
+
+	hdat.values[0] = val;
 
 	if (val == GPIO_LOW)
-		gpio_print_pin("write LOW: P", pin);
+		gpio_print_pin("write LOW: P", pin->pin);
 	else
-		gpio_print_pin("write HIGH: P", pin);
+		gpio_print_pin("write HIGH: P", pin->pin);
 
-	char path[GPIO_PATH_LEN];
-	int fd;
-
-	fd = open(path, O_WRONLY);
-	if (fd == -1)
+	if (ioctl(pin->hreq.fd, GPIOHANDLE_SET_LINE_VALUES_IOCTL, &pin->hreq) == -1)
 	{
-		LOG_ERROR("could not open sysfs: ", errno_msg(errno));
+		LOG_ERROR("could not set value for a pin", errno_msg(errno));
 		return 0;
 	}
 
-	if (write(fd, val == GPIO_LOW ? "0" : "1", 1))
-	{
-		LOG_ERROR("could not write to sysfs: ", errno_msg(errno));
-		return 0;
-	}
-
-	close(fd);
 	return 1;
 }
 

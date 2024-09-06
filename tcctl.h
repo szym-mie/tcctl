@@ -15,6 +15,8 @@
 #include <sys/time.h>
 #include <sys/select.h>
 
+#include <linux/gpio.h>
+
 #define LOG_PATH "./tcctl.log"
 #define LOG_MSG_BUF_LEN 16
 #define CONF_PATH "/etc/tcctl/tcctl.conf"
@@ -31,13 +33,8 @@
 #define TIME_BUF_LEN 16
 #define TEMP_BUF_LEN 8
 
-#define GPIO_SYS_PATH "/sys/class/gpio/"
-#define GPIO_DIR_PATH0 GPIO_SYS_PATH "gpio"
-#define GPIO_DIR_PATH1 "/direction"
 #define GPIO_PATH_LEN 40
 #define GPIO_BUF_LEN 4
-
-#define GPIO_MAX_PIN 27
 
 #define ZERO_STR { '\0' }
 
@@ -152,7 +149,7 @@ int tcctl_loop(void);
 int tcctl_update(void);
 
 int tcctl_gpio_init(void);
-int tcctl_gpio_init_pin(unsigned int);
+int tcctl_gpio_update_conf(unsigned int);
 int tcctl_gpio_write(int);
 
 size_t tcctl_rc_addr_len(const char *);
@@ -193,16 +190,18 @@ int uint_write_pad(unsigned int val, char *str, size_t len);
 int boolean_read(int *, const char *);
 int boolean_write(int, char *);
 
-enum gpio_export
+struct gpio
 {
-	GPIO_OPEN  = 0,
-	GPIO_CLOSE = 1
+	char *path;
+	int chip_fd;
+	struct gpiochip_info info;
 };
 
-enum gpio_dir
+enum gpio_pull
 {
-	GPIO_IN  = 0,
-	GPIO_OUT = 1
+	GPIO_NOPULL,
+	GPIO_PULLDOWN,
+	GPIO_PULLUP
 };
 
 enum gpio_val
@@ -211,9 +210,17 @@ enum gpio_val
 	GPIO_HIGH = 1
 };
 
-int gpio_export(unsigned int pin, enum gpio_export eop);
-int gpio_set_dir(unsigned int pin, enum gpio_dir dir);
-int gpio_write(unsigned int pin, enum gpio_val val);
+struct gpio_pin
+{
+	unsigned int pin;
+	enum gpio_pull pull;
+	struct gpiohandle_request hreq;
+};
+
+int gpio_open(struct gpio *gpio);
+int gpio_close(struct gpio *gpio);
+int gpio_pin(struct gpio *gpio, struct gpio_pin *pin);
+int gpio_write(struct gpio *gpio, struct gpio_pin *pin, enum gpio_val val);
 
 int time_write(char *);
 
